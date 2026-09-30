@@ -16,7 +16,7 @@
 │                                                                      │
 │  ┌─────────────┐    lms-events     ┌──────────────────────────────┐ │
 │  │  Producer   │──────────────────►│      Apache Beam Pipeline    │ │
-│  │(src/producer│   (4 particiones) │       (DirectRunner)         │ │
+│  │(src/producer│   (1 partición)   │    (DirectRunner, batch)     │ │
 │  │    .py)     │                   │                              │ │
 │  └─────────────┘                   │  ValidateAndParseFn          │ │
 │        │                           │       │                      │ │
@@ -52,7 +52,7 @@
 | Paso | Componente | Descripción |
 |------|-----------|-------------|
 | 1 | `src/producer.py` | Lee `data/events.jsonl`, aplica `REPLAY_SPEED`, inyecta escenarios (duplicado, fuera de orden, tardío) y publica en `lms-events`. |
-| 2 | `ReadFromKafka` | Lee mensajes como tuplas `(key_bytes, value_bytes)` usando KafkaIO cross-language. |
+| 2 | `read_kafka_batch()` | Lee mensajes disponibles del topic con Python `confluent_kafka` y los convierte en una `PCollection` acotada mediante `beam.Create()`. |
 | 3 | `ValidateAndParseFn` | Valida esquema JSON, campos requeridos, tipos de evento y timestamps. Eventos inválidos van al DLQ. |
 | 4 | `AssignEventTimeFn` | Extrae `event_time` del payload y crea un `TimestampedValue`. Esto activa el procesamiento por **tiempo de evento** (no de llegada). |
 | 5 | `WindowInto(FixedWindows(300s))` | Agrupa en ventanas fijas de 5 minutos. |
@@ -62,7 +62,7 @@
 | 9 | `CombinePerKey(CountAndScoreCombineFn)` | Acumula `(event_count, total_score)` por estudiante por ventana. |
 | 10 | `FormatMetricFn` | Produce un `dict` con `student_id`, `window_start`, `window_end`, `event_count`, `total_score`, `avg_score`. |
 | 11 | `IdempotentFileSinkFn` | Escribe en `output/metrics.jsonl` con semántica UPSERT. |
-| 12 | `WriteToKafka` | Publica las métricas en `lms-metrics` y los eventos DLQ en `lms-dlq`. |
+| 12 | `KafkaSinkFn` | Publica las métricas en `lms-metrics` y los eventos DLQ en `lms-dlq` mediante `confluent_kafka` Python (DoFn personalizado). |
 
 ---
 
@@ -158,7 +158,7 @@ beam.WindowInto(
 
 **Por qué `allowed_lateness=120s`:** Un sistema LMS puede tener retrasos de red de hasta 2 minutos. Eventos que lleguen dentro de ese plazo después del cierre de la ventana se aceptan y refinan la métrica.
 
-**Nota sobre tests:** El trigger `AfterProcessingTime(30)` requiere un reloj de tiempo real que PrismRunner (runner por defecto en Beam ≥2.74) no provee en `TestPipeline`. Por esto, los tests usan `early_trigger_seconds=0` para desactivar el early trigger, manteniendo el comportamiento de producción intacto.
+**Nota sobre el runner:** En la implementación actual, el pipeline corre en **modo batch** (micro-poll loop) con el DirectRunner. En este modo el watermark avanza automáticamente a +∞ al finalizar el input, por lo que el trigger principal es `AfterWatermark` y el early trigger se configura con `early_trigger_seconds=0`. Los tests usan la misma configuración con `TestPipeline`/`TestStream`.
 
 ### 3.3 Deduplicación stateful
 
@@ -298,12 +298,12 @@ La secuencia produce siempre el mismo resultado determinístico gracias a:
 
 | Componente | Tecnología | Versión |
 |-----------|-----------|---------|
-| Ingesta de eventos | Apache Kafka (KRaft, sin Zookeeper) | Bitnami 3.8 |
+| Ingesta de eventos | Apache Kafka (KRaft, sin Zookeeper) | apache/kafka 3.7.1 |
 | Motor de streaming | Apache Beam | ≥2.74.0 |
 | Runner | DirectRunner → PrismRunner | (incluido en SDK) |
 | Lenguaje | Python | 3.12 |
-| KafkaIO | Cross-language expansion service (Java) | auto-start |
-| Empaquetado | uv | latest |
+| Lector/escritor Kafka | `confluent_kafka` Python | ≥2.6.0 |
+| Empaquetado | pip (imagen pip:3.12-slim) | - |
 | Contenedores | Docker Compose v2 | - |
 | UI de Kafka | kafka-ui | latest |
 
@@ -313,6 +313,8 @@ La secuencia produce siempre el mismo resultado determinístico gracias a:
 
 | Limitación | Impacto | Mitigación |
 |-----------|---------|-----------|
+| DirectRunner streaming + KafkaIO cross-language (Java) no entrega elementos al pipeline Python | Pipeline corre indefinidamente sin producir output | Reemplazado por `read_kafka_batch()` con `confluent_kafka` Python + `beam.Create()` en batch mode |
+| Particiones vacías bloquean el watermark global (DirectRunner calcula watermark = mínimo de todas las particiones) | Con múltiples particiones y distribución desigual, el watermark queda en −∞ y las ventanas nunca cierran | `lms-events` reducido a 1 partición; en producción se recomienda round-robin sin clave o idle watermark configurable |
 | DirectRunner no provee exactly-once end-to-end en Kafka | Duplicados en `lms-metrics` posibles bajo reinicios | Usar Flink/Dataflow + transacciones Kafka en producción |
 | PrismRunner no descarta eventos post-`allowed_lateness` en TestStream | Test `test_late_event_beyond_tolerance_dropped` marcado xfail | El `WindowInto` está correctamente configurado; la limitación es del runner de test |
 | `IdempotentFileSinkFn` recarga el archivo en cada elemento | I/O costoso con muchos estudiantes | Usar un sink en base de datos (Cassandra, BigQuery) en producción |

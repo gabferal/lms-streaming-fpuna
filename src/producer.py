@@ -97,7 +97,7 @@ def produce_events(
             dup = {**event, "arrival_time": _now_iso()}
             producer.produce(
                 topic,
-                key=event["student_id"].encode(),
+                key=(event.get("student_id") or "unknown").encode(),
                 value=json.dumps(dup).encode(),
                 on_delivery=delivery_report,
             )
@@ -108,7 +108,7 @@ def produce_events(
         payload = {**event, "arrival_time": _now_iso()}
         producer.produce(
             topic,
-            key=event["student_id"].encode(),
+            key=(event.get("student_id") or "unknown").encode(),
             value=json.dumps(payload).encode(),
             on_delivery=delivery_report,
         )
@@ -126,7 +126,7 @@ def produce_events(
         }
         producer.produce(
             topic,
-            key=late_event["student_id"].encode(),
+            key=(event.get("student_id") or "unknown").encode(),
             value=json.dumps(late_event).encode(),
             on_delivery=delivery_report,
         )
